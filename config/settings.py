@@ -10,7 +10,6 @@ load_dotenv()
 PLEX_URL = os.getenv("PLEX_URL", "http://nas:32400")
 PLEX_TOKEN = os.getenv("PLEX_TOKEN", "your_default_token_here")
 CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
-CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/0")
 
 # Define logging config file path
 LOGGING_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "logging.conf")

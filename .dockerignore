@@ -1,0 +1,21 @@
+# Ignore Git repository
+.git
+
+# Ignore Python cache & compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore logs
+logs/
+
+# Ignore virtual environments (if using venv)
+venv/
+.env
+
+# Ignore Docker artifacts
+.dockerignore
+Dockerfile
+
+.DS_Store
