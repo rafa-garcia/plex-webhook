@@ -1,5 +1,9 @@
 # Plex Webhook
 
+<p align="center">
+  <img src="assets/screenshot.png" alt="Plex labels added from IMDb keywords">
+</p>
+
 A Flask-based webhook service that automatically updates Plex movie labels using IMDb keywords when new movies are added to your library.
 
 ## Features
@@ -196,18 +200,7 @@ python -m pytest --cov=src
 python -m pytest --cov=src --cov-report=html
 ```
 
-Test files are located in the `tests/` directory and mirror the structure of the `src/` directory:
-- `test_app.py`: Tests for Flask routes and application logic
-- `test_imdb.py`: Tests for IMDb integration
-- `test_plex.py`: Tests for Plex API interactions  
-- `test_tasks.py`: Tests for Celery tasks
-- `test_utils.py`: Tests for utility functions
-
-Tests include:
-- Unit tests for individual functions
-- Integration tests for module interactions
-- Mocking of external services
-- Error case testing
+Test files are located in the `tests/` directory and mirror the structure of the `src/` directory.
 
 ## Error Handling
 
