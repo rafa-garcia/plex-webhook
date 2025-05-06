@@ -1,117 +1,199 @@
-from flask import Flask, request, jsonify
-from src.tasks import async_update_labels
-from src.utils import is_valid_imdb_id, log_event
-import logging
 import json
+from datetime import datetime
+from flask import Flask, request, jsonify
+from src.plex import validate_plex_token
+from src.tasks import async_update_labels, celery
+from src.utils import log_event, sanitise_string, create_error_response
+from src.imdb import validate_imdb_id as is_valid_imdb_id, extract_imdb_id
+from config import settings
 
+# Initialize Flask app
 app = Flask(__name__)
 
 
 @app.route("/health", methods=["GET"])
 def health_check():
     """
-    Health check endpoint to verify API and Redis connectivity.
+    Health check endpoint to verify service status.
+
+    Returns:
+        Tuple[Response, int]: Health status and HTTP code
     """
+    services = {"celery": {"status": "unknown"}, "plex": {"status": "unknown"}}
+    overall_status = "healthy"
+
+    # Check Celery/Redis connection
     try:
-        # Simple Redis connectivity check
-        from celery.result import AsyncResult
-
-        AsyncResult("test")  # This will fail if Celery/Redis is down
-
-        return jsonify({"status": "healthy"}), 200
+        celery.control.ping(timeout=1)
+        services["celery"] = {
+            "status": "connected",
+            "message": "Connected to Redis successfully",
+        }
     except Exception as e:
-        logging.error(f"Health check failed: {str(e)}")
-        return jsonify({"status": "unhealthy", "error": str(e)}), 500
+        services["celery"] = {"status": "error", "message": str(e)}
+        overall_status = "unhealthy"
+
+    # Check Plex connection
+    plex_status, plex_message = validate_plex_token()
+    services["plex"] = {
+        "status": "connected" if plex_status else "error",
+        "message": plex_message,
+    }
+    if not plex_status:
+        overall_status = "unhealthy"
+
+    response = {
+        "status": overall_status,
+        "timestamp": datetime.utcnow().isoformat(),
+        "services": services,
+    }
+
+    log_event(
+        "health_check",
+        {"status": overall_status, "services": services},
+        level="error" if overall_status == "unhealthy" else "info",
+    )
+
+    return jsonify(response), 200 if overall_status == "healthy" else 500
 
 
 @app.route("/plex-webhook", methods=["POST"])
 def plex_webhook():
     """
-    Handles Plex webhook events and triggers IMDb label updates.
+    Handle Plex webhook events and trigger IMDb label updates.
+
+    Returns:
+        Tuple[Response, int]: Response message and HTTP code
     """
     try:
         if "payload" not in request.form:
-            log_event("error", "No payload found in request")
-            return jsonify({"status": "error", "message": "Invalid request"}), 400
+            log_event("error", {"message": "No payload in request"})
+            return create_error_response("Missing payload")
 
-        payload = request.form["payload"]
-        data = json.loads(payload)
+        try:
+            data = json.loads(request.form["payload"])
+        except json.JSONDecodeError:
+            log_event("error", {"message": "Invalid JSON payload"})
+            return create_error_response("Invalid JSON payload")
 
-        log_event("plex_webhook_received", data)
+        log_event("webhook_received", {"data": data})
 
         if not data or data.get("event") != "library.new":
-            log_event("error", "Invalid webhook event")
-            return jsonify({"status": "error", "message": "Invalid data"}), 400
+            return create_error_response("Invalid or unsupported webhook event")
 
         metadata = data.get("Metadata", {})
-        imdb_id = next(
-            (
-                guid["id"].split("imdb://")[1]
-                for guid in metadata.get("Guid", [])
-                if guid["id"].startswith("imdb://")
-            ),
-            None,
+        imdb_id = extract_imdb_id(metadata)
+
+        if not imdb_id:
+            return create_error_response("No valid IMDb ID found")
+
+        rating_key = metadata.get("ratingKey")
+        if not rating_key:
+            return create_error_response("Missing Plex rating key")
+
+        # sanitise metadata fields
+        title = sanitise_string(metadata.get("title"))
+        year = metadata.get("year")
+
+        # Queue background task
+        task = async_update_labels.delay(imdb_id, rating_key)
+
+        log_event(
+            "movie_processing",
+            {
+                "imdb_id": imdb_id,
+                "rating_key": rating_key,
+                "title": title,
+                "year": year,
+                "task_id": task.id,
+            },
         )
 
-        if imdb_id and is_valid_imdb_id(imdb_id):
-            rating_key = metadata.get("ratingKey")
-            title = metadata.get("title")
-            year = metadata.get("year")
-
-            async_update_labels.delay(imdb_id, rating_key)  # Run in background
-
-            log_event(
-                "movie_added",
-                {
-                    "imdb_id": imdb_id,
-                    "rating_key": rating_key,
-                    "title": title,
-                    "year": year,
-                },
-            )
-            return (
-                jsonify(
-                    {"message": f"Processing IMDb ID: {imdb_id}, {title} ({year})"}
-                ),
-                202,
-            )
-
-        return jsonify({"error": "No valid IMDb ID found"}), 400
-
-    except json.JSONDecodeError:
-        log_event("error", "Invalid JSON payload")
-        return jsonify({"status": "error", "message": "Invalid JSON"}), 400
-    except Exception as e:
-        log_event("error_processing_webhook", str(e))
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route("/set-labels/<rating_key>", methods=["POST"])
-def set_labels(rating_key):
-    """
-    Manually triggers IMDb label updates for a specific Plex rating key.
-    """
-    try:
-        data = request.get_json()
-        imdb_id = data.get("imdb_id")
-
-        if not imdb_id or not is_valid_imdb_id(imdb_id):
-            return jsonify({"error": "Valid IMDb ID is required"}), 400
-
-        async_update_labels.delay(imdb_id, rating_key)  # Run in background
-        log_event("set_labels", {"imdb_id": imdb_id, "rating_key": rating_key})
         return (
-            jsonify({"message": f"Processing IMDb ID {imdb_id} in the background"}),
+            jsonify(
+                {
+                    "status": "processing",
+                    "message": f"Processing {title} ({year})",
+                    "task_id": task.id,
+                    "movie": {
+                        "imdb_id": imdb_id,
+                        "rating_key": rating_key,
+                        "title": title,
+                        "year": year,
+                    },
+                }
+            ),
             202,
         )
 
-    except json.JSONDecodeError:
-        log_event("error", "Invalid JSON payload in set-labels")
-        return jsonify({"status": "error", "message": "Invalid JSON"}), 400
     except Exception as e:
-        log_event("error_set_labels", str(e))
-        return jsonify({"error": str(e)}), 500
+        log_event(
+            "error",
+            {"message": "Webhook processing failed", "error": str(e)},
+            level="error",
+        )
+        return create_error_response(f"Internal server error: {str(e)}", 500)
+
+
+@app.route("/update-labels/<rating_key>", methods=["POST"])
+def update_labels(rating_key):
+    """
+    Manually trigger IMDb label updates for a specific Plex rating key.
+
+    Args:
+        rating_key (str): Plex rating key
+
+    Returns:
+        Tuple[Response, int]: Response message and HTTP code
+    """
+    try:
+        if not rating_key.isdigit():
+            return create_error_response("Invalid rating key format")
+
+        try:
+            data = request.get_json()
+        except json.JSONDecodeError:
+            return create_error_response("Invalid JSON payload")
+
+        if not data:
+            return create_error_response("Missing request body")
+
+        imdb_id = data.get("imdb_id")
+        if not imdb_id or not is_valid_imdb_id(imdb_id):
+            return create_error_response("Valid IMDb ID is required")
+
+        # Queue background task
+        task = async_update_labels.delay(imdb_id, rating_key)
+
+        log_event(
+            "manual_label_update",
+            {"imdb_id": imdb_id, "rating_key": rating_key, "task_id": task.id},
+        )
+
+        return (
+            jsonify(
+                {
+                    "status": "processing",
+                    "message": "Label update queued",
+                    "task_id": task.id,
+                    "details": {"imdb_id": imdb_id, "rating_key": rating_key},
+                }
+            ),
+            202,
+        )
+
+    except Exception as e:
+        log_event(
+            "error",
+            {
+                "message": "Manual label update failed",
+                "error": str(e),
+                "rating_key": rating_key,
+            },
+            level="error",
+        )
+        return create_error_response(f"Internal server error: {str(e)}", 500)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=settings.PORT)
